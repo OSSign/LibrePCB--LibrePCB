@@ -27,7 +27,7 @@ env:
   LIBREPCB_BUILD_AUTHOR: "OSSign CI"
 
   # Configure ccache.
-  CCACHE_MAXSIZE: 1G
+  CCACHE_MAXSIZE: '500MB'
 
   # Incremental builds make no sense on CI -> disable it to avoid creating
   # additional build artifacts.
@@ -37,7 +37,7 @@ permissions:
   contents: write
 
 jobs:
-  windows-x64:
+  windows-x86_64:
     name: Windows x86_64
     runs-on: windows-2025
     environment: OSSign
@@ -49,45 +49,34 @@ jobs:
             echo "Docker image digest: ${{ github.event.inputs.builder_digest }}"
             echo "Build author: ${{ env.LIBREPCB_BUILD_AUTHOR }}"
 
-      - uses: actions/checkout@v4
+      # Clone Repository
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           repository: 'LibrePCB/LibrePCB'
           ref: ${{ github.event.inputs.source_branch }}
 
-      - name: Start Docker Container
-        run: >
-          docker run -d -t --name ci -w C:/work
-          -v ${{ github.workspace }}:C:/work
-          -e OS="windows"
-          -e ARCH="x86_64"
-          -e CI_BRANCH_NAME="${{ github.event.inputs.source_branch }}"
-          -e CCACHE_DIR="C:/work/build/.ccache-dir"
-          -e CCACHE_MAXSIZE="${{ env.CCACHE_MAXSIZE }}"
-          -e CARGO_HOME="C:/work/build/.cargo-home"
-          -e CARGO_INCREMENTAL="${{ env.CARGO_INCREMENTAL }}"
-          -e LIBREPCB_BUILD_AUTHOR="${{ env.LIBREPCB_BUILD_AUTHOR }}"
-          "ghcr.io/librepcb/docker-librepcb-dev@${{ github.event.inputs.builder_digest }}"
-
-      - name: Print Environment
-        run: docker exec ci bash ./ci/print_environment.sh
-
-      - name: Install Dependencies
-        run: docker exec ci bash ./ci/install_dependencies.sh
-      # caching --->
-
-      - name: Cache .ccache
-        uses: actions/cache@v4
+      # Restore Caches
+      - id: restore_ccache
+        name: Restore .ccache
+        uses: actions/cache/restore@v5
         with:
-          key: ${{ github.job }}-${{ github.ref }}
-          restore-keys: ${{ github.job }}-refs/heads/master
+          key: ccache-${{ github.job }}-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ github.ref }}
+            ccache-${{ github.job }}-refs/heads/master
+            ccache-${{ github.job }}
           path: build/.ccache-dir
-
-      - name: Cache .cargo
-        uses: actions/cache@v4
+      - id: restore_cargo
+        name: Restore .cargo
+        uses: actions/cache/restore@v5
         with:
-          key: ${{ github.job }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-${{ github.ref }}
-          restore-keys: ${{ github.job }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-refs/heads/master
+          key: cargo-${{ github.job }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            cargo-${{ github.job }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-${{ github.ref }}
+            cargo-${{ github.job }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-refs/heads/master
+            cargo-${{ github.job }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}
+            cargo-${{ github.job }}
           path: |
             ./build/.cargo-home/bin/
             ./build/.cargo-home/registry/index/
@@ -96,13 +85,33 @@ jobs:
             ./build/cargo/
             ./libs/librepcb/rust-core/target/
 
-      # <--- caching
-      - name: Print New Environment  # Print again since it has been modified
+      # Start Docker Container
+      # Workaround for spurious job failures due to Docker error.
+      # https://github.com/actions/runner-images/issues/13729
+      - name: Start Docker Service
+        run: |
+          $dockerState = Get-Service -Name "docker"
+          if ($dockerState.Status -ne "Running") {
+            Start-Service -Name "docker"
+          }
+      - name: Start Docker Container
+        run: >
+          docker run -d -t --name ci -w C:/work
+          -v ${{ github.workspace }}:C:/work
+          -e OS="windows"
+          -e ARCH="x86_64"
+          -e LIBREPCB_BUILD_AUTHOR="${{ env.LIBREPCB_BUILD_AUTHOR }}"
+          -e CCACHE_DIR="C:/work/build/.ccache-dir"
+          -e CCACHE_MAXSIZE="${{ env.CCACHE_MAXSIZE }}"
+          -e CARGO_HOME="C:/work/build/.cargo-home"
+          -e CARGO_INCREMENTAL="${{ env.CARGO_INCREMENTAL }}"
+          "ghcr.io/librepcb/docker-librepcb-dev@${{ github.event.inputs.builder_digest }}"
+      - name: Print Environment
         run: docker exec ci bash ./ci/print_environment.sh
 
+      # Build
       - name: Build LibrePCB
         run: docker exec ci bash ./ci/build_librepcb.sh
-
       - name: Build Archive
         run: >
           docker exec
@@ -114,7 +123,6 @@ jobs:
           -e AST_TIMESTAMP="${{ secrets.AST_TIMESTAMP }}"
           -e AST_VAULT="${{ secrets.AST_VAULT }}"
           ci bash ./ci/build_windows_archive.sh
-
       - name: Build Installer
         run: >
           docker exec
@@ -127,40 +135,77 @@ jobs:
           -e AST_VAULT="${{ secrets.AST_VAULT }}"
           ci bash ./ci/build_windows_installer.sh
 
+      # Upload Artifacts
       - name: Tar Artifacts
         run: docker exec ci bash ./ci/tar_artifacts.sh
-
+      - name: Rename Artifacts
+        run: mv artifacts/artifacts.tar artifacts/${{ github.job }}.tar
       - name: Upload Signed Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ github.job }}
-          path: artifacts/artifacts.tar
+          path: artifacts/${{ github.job }}.tar
+          if-no-files-found: error
 
-  macos-arm64:
-    name: MacOS ARM64
-    # Make sure the 'runs-on' really refers to an Apple Silicon CPU:
-    # https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners
-    runs-on: macos-14
+      # Save Caches
+      - name: Cache .ccache
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.restore_ccache.outputs.cache-primary-key }}
+          path: build/.ccache-dir
+        if: ${{ steps.restore_ccache && (!cancelled()) }}
+      - name: Cache .cargo
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.restore_cargo.outputs.cache-primary-key }}
+          path: |
+            ./build/.cargo-home/bin/
+            ./build/.cargo-home/registry/index/
+            ./build/.cargo-home/registry/cache/
+            ./build/.cargo-home/git/db/
+            ./build/cargo/
+            ./libs/librepcb/rust-core/target/
+        if: ${{ steps.restore_cargo && (!cancelled()) }}
+
+  macos:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     environment: OSSign
     env:
       OS: 'mac'
-      ARCH: 'arm64'
+      ARCH: ${{ matrix.arch }}
       COPYFILE_DISABLE: 1 # https://superuser.com/questions/259703/get-mac-tar-to-stop-putting-filenames-in-tar-archives
       HOMEBREW_NO_INSTALL_CLEANUP: 1 # Might speed up homebrew commands
+      CARGO_INCREMENTAL: 0 # Avoid creating additional build artifacts
       CCACHE_DIR: '/Users/runner/ccache-dir'
       CARGO_HOME: '/Users/runner/cargo-home'
-      # Qt 6.7.3 is the last version that runs on macOS 11.
-      QT_URL: 'https://qt.mirror.constant.com/archive/qt/6.7/6.7.3/single/qt-everywhere-src-6.7.3.tar.xz'
-      QT_SHA256: 'a3f1d257cbb14c6536585ffccf7c203ce7017418e1a0c2ed7c316c20c729c801'
+      QT_URL: ${{ matrix.qt_url }}
+      QT_SHA256: ${{ matrix.qt_sha256 }}
       QT_ROOT: '/Users/runner/qt'
       OCC_VERSION: '7_9_1'
+      OCC_SHA256: 'de442298cd8860f5580b01007f67f0ecd0b8900cfa4da467fa3c823c2d1a45df'
       OCC_ROOT: '/Users/runner/occ'
-      MACOSX_DEPLOYMENT_TARGET: '11'  # Picked up by CMake and Rust
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}  # Picked up by CMake and Rust
       CMAKE_PREFIX_PATH: '/Users/runner/qt/lib/cmake/Qt6:/Users/runner/occ/lib/cmake/opencascade'
-    
-      # Build application with hardened runtime as it is required for notarizing.
-      CMAKE_XCODE_ATTRIBUTE_ENABLE_HARDENED_RUNTIME: YES
-
+      CMAKE_XCODE_ATTRIBUTE_ENABLE_HARDENED_RUNTIME: 'YES'  # Required for notarizing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: MacOS ARM64
+            runner: macos-14  # Must be an ARM64 CPU: https://github.com/actions/runner-images
+            arch: arm64
+            deployment_target: '11'
+            # Qt 6.7.3 is the last version that runs on macOS 11.
+            qt_url: 'https://download.qt.io/archive/qt/6.7/6.7.3/single/qt-everywhere-src-6.7.3.tar.xz'
+            qt_sha256: 'a3f1d257cbb14c6536585ffccf7c203ce7017418e1a0c2ed7c316c20c729c801'
+          - name: MacOS x86_64
+            runner: macos-15-intel  # Must be an x86_64 CPU: https://github.com/actions/runner-images
+            arch: x86_64
+            deployment_target: '10.14'
+            # Qt 6.5.8 is the last version that runs on macOS 10.14.
+            qt_url: 'https://qt.mirror.constant.com/archive/qt/6.5/6.5.8/src/single/qt-everywhere-opensource-src-6.5.8.tar.xz'
+            qt_sha256: '4eeb391891b325cd00aed6e42cb4ef966ffeef0877e188c9667a702944760c27'
     steps:
       - name: Info
         run: |
@@ -168,28 +213,43 @@ jobs:
             echo "LibrePCB source ref: ${{ github.event.inputs.source_branch }}"
             echo "Build author: ${{ env.LIBREPCB_BUILD_AUTHOR }}"
 
-      - uses: actions/checkout@v4
+      # Clone Repository
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           repository: 'LibrePCB/LibrePCB'
           ref: ${{ github.event.inputs.source_branch }}
-
       - name: Print Environment
         run: ./ci/print_environment.sh
-      # caching --->
 
-      - name: Cache .ccache
-        uses: actions/cache@v4
+      # Install System Dependencies
+      - name: Install System Dependencies
+        run: |
+          source ./ci/install_dependencies.sh
+          # Pass modified PATH to following steps:
+          echo "$PATH" > "$GITHUB_PATH"
+
+      # Restore Caches
+      - id: restore_ccache
+        name: Restore .ccache
+        uses: actions/cache/restore@v5
         with:
-          key: ${{ github.job }}-${{ github.ref }}
-          restore-keys: ${{ github.job }}-refs/heads/master
+          key: ccache-${{ matrix.runner }}-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.runner }}-${{ github.ref }}
+            ccache-${{ matrix.runner }}-refs/heads/master
+            ccache-${{ matrix.runner }}
           path: ${{ env.CCACHE_DIR }}
-
-      - name: Cache .cargo
-        uses: actions/cache@v4
+      - id: restore_cargo
+        name: Restore .cargo
+        uses: actions/cache/restore@v5
         with:
-          key: ${{ github.job }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-${{ github.ref }}
-          restore-keys: ${{ github.job }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-refs/heads/master
+          key: cargo-${{ matrix.runner }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            cargo-${{ matrix.runner }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-${{ github.ref }}
+            cargo-${{ matrix.runner }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}-refs/heads/master
+            cargo-${{ matrix.runner }}-${{ hashFiles('libs/librepcb/**/Cargo.lock') }}
+            cargo-${{ matrix.runner }}
           path: |
             ${{ env.CARGO_HOME }}/bin/
             ${{ env.CARGO_HOME }}/registry/index/
@@ -197,107 +257,131 @@ jobs:
             ${{ env.CARGO_HOME }}/git/db/
             ./build/cargo/
             ./libs/librepcb/rust-core/target/
-
-      - name: Cache Qt
-        uses: actions/cache@v4
+      - id: restore_qt
+        name: Restore Qt Cache
+        uses: actions/cache/restore@v5
         with:
-          key: qt-${{ env.QT_SHA256 }}-macos-${{ env.MACOSX_DEPLOYMENT_TARGET }}-v6
+          key: ${{ matrix.runner }}-${{ env.MACOSX_DEPLOYMENT_TARGET }}-qt-${{ env.QT_SHA256 }}-v7
           path: ${{ env.QT_ROOT }}
-
-      - name: Cache OpenCascade
-        uses: actions/cache@v4
+      - id: restore_occ
+        name: Restore OpenCascade Cache
+        uses: actions/cache/restore@v5
         with:
-          key: occ-${{ env.OCC_VERSION }}-macos-${{ env.MACOSX_DEPLOYMENT_TARGET }}-v6
+          key: ${{ matrix.runner }}-${{ env.MACOSX_DEPLOYMENT_TARGET }}-occ-${{ env.OCC_VERSION }}-v7
           path: ${{ env.OCC_ROOT }}
 
-      # <--- caching
-      - name: Install Dependencies
-        run: |
-          source ./ci/install_dependencies.sh
-          # Pass modified PATH to following steps:
-          echo "$PATH" > "$GITHUB_PATH"
-
+      # Install Dependencies
+      - id: install_qt
+        name: Build & Install Qt
+        run: ./ci/install_qt.sh
+        if: ${{ (steps.restore_qt.outputs.cache-hit != 'true') && (!cancelled()) }}
+      - id: install_occ
+        name: Build & Install OpenCascade
+        run: ./ci/install_occ.sh
+        if: ${{ (steps.restore_occ.outputs.cache-hit != 'true') && (!cancelled()) }}
       - name: Print New Environment
         run: ./ci/print_environment.sh
 
+      # Build LibrePCB Bundle
       - name: Build LibrePCB
         run: ./ci/build_librepcb.sh
-
       - name: Build Bundle
         run: ./ci/build_mac_bundle.sh
 
+      # Sign Bundle
       - name: Install App Store Connect API Key
         run: |
-             mkdir -p private_keys/
-             echo '${{ secrets.MACOS_NOTARY_JSON }}' > private_keys/macos_notary.json
-             echo '${{ secrets.MACOS_SIGN_PEM }}' > private_keys/macos.pem
-
+          mkdir -p private_keys/
+          echo '${{ secrets.MACOS_NOTARY_JSON }}' > private_keys/macos_notary.json
+          echo '${{ secrets.MACOS_SIGN_PEM }}' > private_keys/macos.pem
       - name: Sign App
         uses: indygreg/apple-code-sign-action@v1
         with:
-             input_path: build/install/LibrePCB.app
-             pem_file: private_keys/macos.pem
-             app_store_connect_api_key_json_file: private_keys/macos_notary.json
-             sign_args: |
-                --code-signature-flags
-                Contents/MacOS/librepcb-cli:runtime
-                --code-signature-flags
-                Contents/MacOS/librepcb:runtime
+          input_path: build/install/LibrePCB.app
+          pem_file: private_keys/macos.pem
+          app_store_connect_api_key_json_file: private_keys/macos_notary.json
+          sign_args: |
+            --code-signature-flags
+            Contents/MacOS/librepcb-cli:runtime
+            --code-signature-flags
+            Contents/MacOS/librepcb:runtime
 
+      # Build & Sign DMG
       - name: Build DMG
         run: ./ci/build_mac_dmg.sh
-
       - name: Sign and Notarize
         uses: indygreg/apple-code-sign-action@v1
         with:
-             input_path: artifacts/nightly_builds/librepcb-nightly-mac-${{ env.ARCH }}.dmg
-             notarize: true
-             staple: true
-             pem_file: private_keys/macos.pem
-             app_store_connect_api_key_json_file: private_keys/macos_notary.json
+          input_path: artifacts/nightly_builds/librepcb-nightly-mac-${{ env.ARCH }}.dmg
+          notarize: true
+          staple: true
+          pem_file: private_keys/macos.pem
+          app_store_connect_api_key_json_file: private_keys/macos_notary.json
 
+      # Upload Artifacts
       - name: Tar Artifacts
         run: ./ci/tar_artifacts.sh
-
+      - name: Rename Artifacts
+        run: mv artifacts/artifacts.tar artifacts/${{ github.job }}-${{ env.ARCH }}.tar
       - name: Upload Signed Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ github.job }}
-          path: artifacts/artifacts.tar
+          name: ${{ github.job }}-${{ env.ARCH }}
+          path: artifacts/${{ github.job }}-${{ env.ARCH }}.tar
+          if-no-files-found: error
+
+      # Save Caches
+      - name: Cache .ccache
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.restore_ccache.outputs.cache-primary-key }}
+          path: ${{ env.CCACHE_DIR }}
+        if: ${{ steps.restore_ccache && (!cancelled()) }}
+      - name: Cache .cargo
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.restore_cargo.outputs.cache-primary-key }}
+          path: |
+            ${{ env.CARGO_HOME }}/bin/
+            ${{ env.CARGO_HOME }}/registry/index/
+            ${{ env.CARGO_HOME }}/registry/cache/
+            ${{ env.CARGO_HOME }}/git/db/
+            ./build/cargo/
+            ./libs/librepcb/rust-core/target/
+        if: ${{ steps.restore_cargo && (!cancelled()) }}
+      - name: Cache Qt
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.restore_qt.outputs.cache-primary-key }}
+          path: ${{ env.QT_ROOT }}
+        if: ${{ (steps.install_qt.outcome == 'success') && always() }}
+      - name: Cache OpenCascade
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.restore_occ.outputs.cache-primary-key }}
+          path: ${{ env.OCC_ROOT }}
+        if: ${{ (steps.install_occ.outcome == 'success') && always() }}
 
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [windows-x64, macos-arm64]
+    needs: [windows-x86_64, macos]
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
-          name: windows-x64
-          path: artifacts_pub/windows-x64
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-arm64
-          path: artifacts_pub/macos-arm64
-      
-      - name: Move artifacts
-        run: |
-          mv artifacts_pub/windows-x64/artifacts.tar windows-x64.tar
-          mv artifacts_pub/macos-arm64/artifacts.tar macos-arm64.tar
+          path: artifacts
+          merge-multiple: true
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           name: ${{ github.event.inputs.release_name }}
           tag_name: ${{ github.run_id }}
-          files: |
-            windows-x64.tar
-            macos-arm64.tar
+          files: artifacts/*.tar
           body: |
             # Signed Release ${{ github.event.inputs.release_name }}
-            
+
             These are the distributable files for the signed release of LibrePCB ${{ github.event.inputs.release_name }}
 
             The source code was fetched from https://github.com/LibrePCB/LibrePCB@${{ github.event.inputs.source_branch }}
